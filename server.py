@@ -85,6 +85,25 @@ elif PANCAKE_ENABLED and not PANCAKE_API_KEY:
 else:
     print('🔌 PANCAKE desactivado (PANCAKE_ENABLED!=true). Leads solo en logs.')
 
+# === GOOGLE DRIVE — archivo de resultados + PDF por cliente ===
+# Webhook de Apps Script (ver drive_webhook.gs) desplegado en la cuenta de
+# Potencia. Mismo patrón kill-switch que Pancake: si está off o falla, el
+# diagnóstico sigue funcionando igual (los resultados ya quedan en logs y CRM).
+DRIVE_ENABLED = _get_env_var('DRIVE_ENABLED', 'false').lower() == 'true'
+DRIVE_WEBHOOK_URL = _get_env_var('DRIVE_WEBHOOK_URL')
+DRIVE_WEBHOOK_TOKEN = _get_env_var('DRIVE_WEBHOOK_TOKEN')
+# Timeout más generoso que Pancake: el PDF pesa varios MB y Apps Script tarda.
+DRIVE_TIMEOUT_SEG = int(_get_env_var('DRIVE_TIMEOUT_SEG', '30'))
+# Tope del PDF en base64 (~15 MB reales). Los reportes normales pesan 1-4 MB.
+DRIVE_PDF_MAX_B64 = 20 * 1024 * 1024
+
+if DRIVE_ENABLED and DRIVE_WEBHOOK_URL and DRIVE_WEBHOOK_TOKEN:
+    print(f'✅ DRIVE habilitado → webhook Apps Script (timeout {DRIVE_TIMEOUT_SEG}s)')
+elif DRIVE_ENABLED:
+    print('⚠️  DRIVE_ENABLED=true pero falta DRIVE_WEBHOOK_URL o DRIVE_WEBHOOK_TOKEN')
+else:
+    print('🔌 DRIVE desactivado (DRIVE_ENABLED!=true).')
+
 app = Flask(__name__, static_folder='.')
 # CORS explícito: el frontend (potenciaempresarial.site) llama directo a este backend
 # (potencia-api.onrender.com) — es cross-origin. Declaramos methods y headers permitidos
@@ -94,6 +113,8 @@ CORS(app, resources={r"/api/*": {
     "methods": ["GET", "POST", "OPTIONS"],
     "allow_headers": ["Content-Type"],
 }})
+# Tope global de request: protege /api/pdf de payloads absurdos (PDF normal: 1-4 MB).
+app.config['MAX_CONTENT_LENGTH'] = 25 * 1024 * 1024
 client = anthropic.Anthropic(api_key=API_KEY) if API_KEY else None
 
 
@@ -190,6 +211,107 @@ def enviar_lead_a_pancake(datos, resultado):
         return False, f'Exception: {e}'
 
 
+def _post_a_drive(payload):
+    """
+    POST al webhook de Apps Script. Apps Script responde con redirect 302 a
+    script.googleusercontent.com — urllib lo sigue solo y ahí viene el JSON
+    {ok, mensaje}. Diseño defensivo igual que Pancake: nunca interrumpe.
+
+    Retorna: (ok: bool, mensaje: str)
+    """
+    if not DRIVE_ENABLED:
+        return False, 'DRIVE_ENABLED=false (kill-switch activo)'
+    if not DRIVE_WEBHOOK_URL or not DRIVE_WEBHOOK_TOKEN:
+        return False, 'DRIVE_WEBHOOK_URL/TOKEN no configurados'
+
+    payload = dict(payload)
+    payload['token'] = DRIVE_WEBHOOK_TOKEN
+    try:
+        req = urllib.request.Request(
+            DRIVE_WEBHOOK_URL,
+            data=json.dumps(payload, ensure_ascii=False).encode('utf-8'),
+            headers={'Content-Type': 'application/json'},
+            method='POST',
+        )
+        with urllib.request.urlopen(req, timeout=DRIVE_TIMEOUT_SEG) as resp:
+            body = resp.read().decode('utf-8', errors='replace')
+        try:
+            data = json.loads(body)
+        except json.JSONDecodeError:
+            return False, f'respuesta no-JSON de Apps Script: {body[:200]}'
+        if data.get('ok'):
+            return True, data.get('mensaje', 'OK')
+        return False, f'Apps Script rechazó: {data.get("mensaje", body[:200])}'
+    except urllib.error.HTTPError as e:
+        return False, f'HTTP {e.code}: {e.read().decode("utf-8", errors="replace")[:300]}'
+    except urllib.error.URLError as e:
+        return False, f'URLError: {e.reason}'
+    except Exception as e:
+        return False, f'Exception: {e}'
+
+
+def carpeta_cliente(datos, momento):
+    """Nombre determinístico de la subcarpeta en Drive para este diagnóstico.
+    El frontend recibe este mismo string y lo usa al subir el PDF, así ambos
+    archivos caen en la misma carpeta (Apps Script hace find-or-create)."""
+    empresa = re.sub(r'[/\\\n\r]+', ' ', (datos.get('empresa') or 'Sin empresa')).strip()
+    return f"{momento.strftime('%Y-%m-%d %H%M')} — {empresa}"[:120]
+
+
+def enviar_resultados_a_drive(datos, resultado, carpeta):
+    """Archiva en Drive el JSON completo + un resumen legible del diagnóstico."""
+    oportunidades = resultado.get('oportunidades') or []
+    lineas_oport = '\n'.join(
+        f"{i}. **{o.get('titulo', 'N/A')}** — {o.get('impacto', '?')} · {o.get('plazo', '?')} · ROI: {o.get('roiEstimado', '?')}\n   {o.get('descripcion', '')}"
+        for i, o in enumerate(oportunidades, 1)
+    ) or 'N/A'
+
+    resumen_md = f"""# Diagnóstico Web Express — {datos.get('empresa', 'N/A')}
+
+**Fecha:** {datetime.now().strftime('%Y-%m-%d %H:%M')}
+**Contacto:** {datos.get('nombre', 'N/A')} · {datos.get('correo', 'N/A')} · {datos.get('telefono') or 'sin teléfono'}
+
+## Score: {resultado.get('score', 0)}/100 — {resultado.get('nivel', 'Sin clasificar')}
+
+{resultado.get('descripcionNivel', '')}
+
+| Dimensión | Puntos |
+|---|---|
+| Presencia Digital | {(resultado.get('scoreDetalle') or {}).get('presenciaDigital', '?')}/25 |
+| Automatización | {(resultado.get('scoreDetalle') or {}).get('automatizacion', '?')}/25 |
+| Datos & Decisiones | {(resultado.get('scoreDetalle') or {}).get('datosDecisiones', '?')}/25 |
+| Marketing IA | {(resultado.get('scoreDetalle') or {}).get('marketingIA', '?')}/25 |
+
+## Perfil de la empresa
+
+- **Industria:** {datos.get('industria', 'N/A')} · **Empleados:** {datos.get('empleados', 'N/A')} · **Facturación:** {datos.get('facturacion', 'N/A')}
+- **Objetivo del año:** {datos.get('objetivo', 'N/A')}
+- **Mayor desafío:** {datos.get('desafio', 'N/A')}
+- **Web:** {datos.get('tienePaginaWeb', 'N/A')} · **Gestión de leads:** {datos.get('gestionLeads', 'N/A')}
+- **Automatizaciones:** {datos.get('tieneAutomatizaciones', 'N/A')} · **Horas manuales/sem:** {datos.get('horasManuales', 'N/A')}
+- **Publicidad:** {datos.get('tienePublicidad', 'N/A')} · **Presupuesto mkt:** {datos.get('presupuestoMarketing', 'N/A')}
+
+## Top oportunidades sugeridas
+
+{lineas_oport}
+
+---
+_Los datos completos (respuestas + reporte IA) están en `resultado.json` de esta misma carpeta._
+"""
+
+    payload = {
+        'accion': 'resultado',
+        'carpeta': carpeta,
+        'resultado': {
+            'capturado': datetime.now().isoformat(),
+            'respuestas_formulario': datos,
+            'reporte_ia': resultado,
+        },
+        'resumen_md': resumen_md,
+    }
+    return _post_a_drive(payload)
+
+
 @app.route('/health')
 def health():
     """Endpoint de salud — Render lo usa para verificar que la app está viva."""
@@ -204,6 +326,52 @@ def index():
 @app.route('/<path:filename>')
 def static_files(filename):
     return send_from_directory('.', filename)
+
+
+@app.route('/api/pdf', methods=['POST'])
+def recibir_pdf():
+    """
+    Recibe el PDF del reporte (base64) generado por html2pdf.js en el navegador
+    y lo reenvía a Drive vía el webhook de Apps Script. El PDF solo existe
+    client-side, por eso el navegador es quien lo aporta.
+    """
+    if not (DRIVE_ENABLED and DRIVE_WEBHOOK_URL and DRIVE_WEBHOOK_TOKEN):
+        return jsonify({'ok': False, 'error': 'Archivo en Drive desactivado'}), 503
+
+    data = request.get_json(silent=True) or {}
+    carpeta = (data.get('carpeta') or '').strip()
+    pdf_b64 = data.get('pdf_base64') or ''
+    filename = (data.get('filename') or 'reporte.pdf').strip()
+
+    if not carpeta or not pdf_b64:
+        return jsonify({'ok': False, 'error': 'Faltan carpeta o pdf_base64'}), 400
+    if len(pdf_b64) > DRIVE_PDF_MAX_B64:
+        print(f'⚠️  /api/pdf rechazado por tamaño: {len(pdf_b64)} chars b64 ({carpeta})', flush=True)
+        return jsonify({'ok': False, 'error': 'PDF demasiado grande'}), 413
+    # Solo nombres de archivo simples (sin rutas) y siempre .pdf
+    filename = re.sub(r'[/\\\n\r]+', '_', filename)[:150]
+    if not filename.lower().endswith('.pdf'):
+        filename += '.pdf'
+
+    def _enviar_pdf_background(carpeta_s, filename_s, pdf_s):
+        try:
+            ok, msg = _post_a_drive({
+                'accion': 'pdf',
+                'carpeta': carpeta_s,
+                'filename': filename_s,
+                'pdf_base64': pdf_s,
+            })
+            print(f'📁 Drive PDF (async): {"✅" if ok else "⚠️"} {msg} [{carpeta_s}]', flush=True)
+        except Exception as e:
+            print(f'⚠️  Excepción subiendo PDF a Drive: {e}', flush=True)
+
+    threading.Thread(
+        target=_enviar_pdf_background,
+        args=(carpeta, filename, pdf_b64),
+        daemon=True,
+        name='drive-pdf-async',
+    ).start()
+    return jsonify({'ok': True, 'mensaje': 'PDF en camino a Drive'}), 202
 
 
 @app.route('/api/diagnostico', methods=['POST'])
@@ -369,7 +537,26 @@ Genera el análisis ÚNICAMENTE como JSON puro (sin markdown, sin explicaciones,
                 name='pancake-crm-async',
             ).start()
 
-        return jsonify({'ok': True, 'resultado': resultado})
+        # === ARCHIVAR RESULTADOS EN GOOGLE DRIVE (background, mismo patrón) ===
+        # 'carpeta' viaja también al frontend: cuando el navegador genere el PDF
+        # lo sube a /api/pdf con este mismo nombre y cae en la misma subcarpeta.
+        carpeta = carpeta_cliente(datos, inicio)
+        if DRIVE_ENABLED and DRIVE_WEBHOOK_URL:
+            def _enviar_drive_background(datos_snapshot, resultado_snapshot, carpeta_snapshot):
+                try:
+                    drv_ok, drv_msg = enviar_resultados_a_drive(datos_snapshot, resultado_snapshot, carpeta_snapshot)
+                    print(f'📁 Drive resultados (async): {"✅" if drv_ok else "⚠️"} {drv_msg}', flush=True)
+                except Exception as drv_err:
+                    print(f'⚠️  Excepción archivando en Drive (lead en logs): {drv_err}', flush=True)
+
+            threading.Thread(
+                target=_enviar_drive_background,
+                args=(datos, resultado, carpeta),
+                daemon=True,
+                name='drive-resultados-async',
+            ).start()
+
+        return jsonify({'ok': True, 'resultado': resultado, 'carpeta': carpeta})
 
     # === MANEJO DE ERRORES GRANULAR (POE-N-01 §5: logging proactivo) ===
     # Cada tipo de error registra contexto completo en logs y devuelve un

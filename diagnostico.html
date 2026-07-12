@@ -639,11 +639,18 @@
           throw new Error(json.error || 'Error desconocido');
         }
 
+        // Subcarpeta de Drive asignada por el backend para este diagnóstico.
+        // El PDF que generemos aquí se sube a /api/pdf con este mismo nombre.
+        carpetaDrive = json.carpeta || null;
+
         // Render dentro de try/catch propio para no perder errores en setTimeout
         setTimeout(() => {
           try {
             renderReporte(json.resultado, datos);
             document.body.style.overflow = '';
+            // Archivar el PDF en Drive unos segundos después, cuando el
+            // usuario ya está leyendo (no compite con el render inicial).
+            setTimeout(subirPDFaDrive, 5000);
           } catch (renderErr) {
             console.error('[diagnostico] Error renderizando reporte:', renderErr, json.resultado);
             document.body.style.overflow = '';
@@ -668,6 +675,9 @@
 
     // Guarda los datos del usuario en una variable global para usarlos en el PDF filename
     let datosUsuarioActual = null;
+    // Subcarpeta de Drive de este diagnóstico (la asigna el backend) + guarda anti-duplicado
+    let carpetaDrive = null;
+    let pdfSubidoADrive = false;
 
     function renderReporte(r, datos) {
       datosUsuarioActual = datos;
@@ -761,22 +771,13 @@
       window.scrollTo({ top: 0, behavior: 'smooth' });
     }
 
-    function descargarPDF() {
-      const elemento = document.getElementById('reporteContenido');
+    function opcionesPDF(elemento) {
       const empresa = (datosUsuarioActual?.empresa || 'Empresa').trim().replace(/[^a-zA-Z0-9]/g, '_');
       const nombre = (datosUsuarioActual?.nombre || '').trim().split(' ')[0].replace(/[^a-zA-Z]/g, '');
       const fecha = new Date().toISOString().slice(0, 10);
       const filename = nombre
         ? `Diagnostico_IA_${empresa}_${nombre}_${fecha}.pdf`
         : `Diagnostico_IA_${empresa}_${fecha}.pdf`;
-
-      // Mostrar indicador de generación
-      const btn = event?.target?.closest('button');
-      const txtOriginal = btn?.innerHTML;
-      if (btn) {
-        btn.innerHTML = '⏳ Generando PDF nítido...';
-        btn.disabled = true;
-      }
 
       // Escala DINÁMICA acotada por el límite de lienzo de Safari iOS (~16,7M px).
       // Con scale fijo 3 el canvas del reporte (~900×4000 px CSS) superaba ese tope
@@ -811,12 +812,57 @@
         pagebreak: { mode: ['css', 'legacy'] }
       };
 
+      return { opt, filename };
+    }
+
+    function descargarPDF() {
+      const elemento = document.getElementById('reporteContenido');
+      const { opt } = opcionesPDF(elemento);
+
+      // Mostrar indicador de generación
+      const btn = event?.target?.closest('button');
+      const txtOriginal = btn?.innerHTML;
+      if (btn) {
+        btn.innerHTML = '⏳ Generando PDF nítido...';
+        btn.disabled = true;
+      }
+
       html2pdf().set(opt).from(elemento).save().then(() => {
         if (btn) {
           btn.innerHTML = txtOriginal;
           btn.disabled = false;
         }
       });
+    }
+
+    // Archiva en Drive el mismo PDF que ve el cliente (vía backend /api/pdf).
+    // Corre en segundo plano tras mostrar el reporte; cualquier fallo se ignora
+    // en silencio — NUNCA debe afectar la experiencia del usuario.
+    function subirPDFaDrive() {
+      if (pdfSubidoADrive || !carpetaDrive) return;
+      const elemento = document.getElementById('reporteContenido');
+      if (!elemento || !elemento.offsetParent) return; // el reporte ya no está visible
+      pdfSubidoADrive = true; // marca antes de empezar para no duplicar
+
+      try {
+        const { opt, filename } = opcionesPDF(elemento);
+        html2pdf().set(opt).from(elemento).outputPdf('blob').then(blob => {
+          const reader = new FileReader();
+          reader.onloadend = () => {
+            const base64 = String(reader.result).split(',')[1];
+            if (!base64) return;
+            fetch('https://potencia-api.onrender.com/api/pdf', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ carpeta: carpetaDrive, filename: filename, pdf_base64: base64 })
+            }).then(r => console.log('[drive] PDF enviado:', r.status))
+              .catch(err => console.warn('[drive] no se pudo subir el PDF:', err));
+          };
+          reader.readAsDataURL(blob);
+        }).catch(err => console.warn('[drive] no se pudo generar el PDF de archivo:', err));
+      } catch (err) {
+        console.warn('[drive] error inesperado archivando PDF:', err);
+      }
     }
 
     function reiniciar() {
